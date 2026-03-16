@@ -1,23 +1,61 @@
+import warnings
+
 import torch
+
+
+def _warn_flash_attn_unavailable(name, exc):
+    warnings.warn(
+        f'{name} is unavailable ({exc.__class__.__name__}: {exc}). '
+        'Falling back to torch scaled_dot_product_attention.')
+
 
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError) as exc:
+    flash_attn_interface = None
     FLASH_ATTN_3_AVAILABLE = False
+    _warn_flash_attn_unavailable('flash_attn_interface', exc)
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError) as exc:
+    flash_attn = None
     FLASH_ATTN_2_AVAILABLE = False
-
-import warnings
+    _warn_flash_attn_unavailable('flash_attn', exc)
 
 __all__ = [
     'flash_attention',
     'attention',
 ]
+
+
+def _scaled_dot_product_attention_fallback(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    causal=False,
+    dtype=torch.bfloat16,
+):
+    if q_lens is not None or k_lens is not None:
+        warnings.warn(
+            'Padding mask is disabled when using '
+            'scaled_dot_product_attention. It can have a significant impact '
+            'on performance.')
+    attn_mask = None
+
+    q = q.transpose(1, 2).to(dtype)
+    k = k.transpose(1, 2).to(dtype)
+    v = v.transpose(1, 2).to(dtype)
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+
+    return out.transpose(1, 2).contiguous()
 
 
 def flash_attention(
@@ -48,6 +86,18 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return _scaled_dot_product_attention_fallback(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            causal=causal,
+            dtype=dtype,
+        )
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -160,19 +210,13 @@ def attention(
             dtype=dtype,
             version=fa_version,
         )
-    else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
-
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+    return _scaled_dot_product_attention_fallback(
+        q=q,
+        k=k,
+        v=v,
+        q_lens=q_lens,
+        k_lens=k_lens,
+        dropout_p=dropout_p,
+        causal=causal,
+        dtype=dtype,
+    )
